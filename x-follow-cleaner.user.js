@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Follow Cleaner Local
 // @namespace    local.x.follow.cleaner
-// @version      0.3.0
-// @description  Local-first X following cleaner with whitelist import/export and limited unfollow batches.
+// @version      0.4.0
+// @description  Local-first X cleaner with non-mutual unfollow and optional follow-back batches.
 // @author       baor87492-star
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -19,12 +19,15 @@
   const UI_ID = 'xfc-panel';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   let scanMap = new Map();
+  let followBackMap = new Map();
   let scanning = false;
   let unfollowing = false;
+  let followingBack = false;
 
   const zh = {
     followsYou: '\u5173\u6ce8\u4e86\u4f60',
     following: '\u6b63\u5728\u5173\u6ce8',
+    followBack: '\u56de\u5173',
     unfollow: '\u53d6\u5173',
     verified: '\u8ba4\u8bc1\u8d26\u53f7',
   };
@@ -46,9 +49,37 @@
     }
   }
 
+  function isFollowersPage(url = location.href) {
+    try {
+      const parsed = new URL(url);
+      return /^(x|twitter)\.com$/i.test(parsed.hostname) && /^\/[A-Za-z0-9_]+\/followers\/?$/.test(parsed.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function isVerifiedFollowersPage(url = location.href) {
+    try {
+      const parsed = new URL(url);
+      return /^(x|twitter)\.com$/i.test(parsed.hostname) && /^\/[A-Za-z0-9_]+\/(verified_followers|followers_verified|followers\/verified)\/?$/.test(parsed.pathname);
+    } catch {
+      return false;
+    }
+  }
+
   function getFollowingUrl(handle) {
     const clean = normalizeHandle(handle);
     return clean ? `https://x.com/${clean}/following` : '';
+  }
+
+  function getFollowersUrl(handle) {
+    const clean = normalizeHandle(handle);
+    return clean ? `https://x.com/${clean}/followers` : '';
+  }
+
+  function getVerifiedFollowersUrl(handle) {
+    const clean = normalizeHandle(handle);
+    return clean ? `https://x.com/${clean}/verified_followers` : '';
   }
 
   function inferHandleFromPage() {
@@ -65,11 +96,14 @@
         keep: parsed?.keep || [],
         selected: parsed?.selected || [],
         done: parsed?.done || [],
+        followSelected: parsed?.followSelected || [],
+        followDone: parsed?.followDone || [],
+        view: parsed?.view || '',
         batchSize: parsed?.batchSize || 10,
         delayMs: parsed?.delayMs || 4500,
       };
     } catch {
-      return { keep: [], selected: [], done: [], batchSize: 10, delayMs: 4500 };
+      return { keep: [], selected: [], done: [], followSelected: [], followDone: [], view: '', batchSize: 10, delayMs: 4500 };
     }
   }
 
@@ -84,15 +118,20 @@
       keep: new Set(state.keep.map(normalizeHandle)),
       selected: new Set(state.selected.map(normalizeHandle)),
       done: new Set(state.done.map(normalizeHandle)),
+      followSelected: new Set((state.followSelected || []).map(normalizeHandle)),
+      followDone: new Set((state.followDone || []).map(normalizeHandle)),
     };
   }
 
-  function persistSets({ keep, selected, done, batchSize, delayMs }) {
+  function persistSets({ keep, selected, done, followSelected, followDone, view, batchSize, delayMs }) {
     const old = loadState();
     saveState({
-      keep: [...keep].filter(Boolean).sort(),
-      selected: [...selected].filter(Boolean).sort(),
-      done: [...done].filter(Boolean).sort(),
+      keep: [...(keep || old.keep || [])].filter(Boolean).sort(),
+      selected: [...(selected || old.selected || [])].filter(Boolean).sort(),
+      done: [...(done || old.done || [])].filter(Boolean).sort(),
+      followSelected: [...(followSelected || old.followSelected || [])].filter(Boolean).sort(),
+      followDone: [...(followDone || old.followDone || [])].filter(Boolean).sort(),
+      view: view || old.view || '',
       batchSize: Number(batchSize || old.batchSize || 10),
       delayMs: Number(delayMs || old.delayMs || 4500),
     });
@@ -109,10 +148,15 @@
       const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
       const handleIndex = lines.findIndex((line) => normalizeHandle(line) === handle || line.toLowerCase() === `@${handle}`);
       const name = handleIndex > 0 ? lines[handleIndex - 1] : lines[0] || '';
+      const buttonTexts = [...cell.querySelectorAll('button[role="button"], div[role="button"]')].map((button) => `${button.innerText || ''} ${button.getAttribute('aria-label') || ''}`);
+      const canFollowBack = buttonTexts.some((buttonText) => buttonText.includes(zh.followBack) || /follow back/i.test(buttonText));
+      const verified = text.includes(zh.verified) || /verified/i.test(text) || Boolean(cell.querySelector('[data-testid="icon-verified"], svg[aria-label*="Verified"], svg[aria-label*="\u8ba4\u8bc1"]'));
       accounts.push({
         handle,
         name: name.replace(new RegExp(zh.verified, 'g'), '').trim(),
         followsYou: text.includes(zh.followsYou) || /follows you/i.test(text),
+        canFollowBack,
+        verified,
       });
     });
     return accounts;
@@ -122,10 +166,26 @@
     accounts.forEach((account) => {
       const handle = normalizeHandle(account.handle);
       if (!handle) return;
-      const old = scanMap.get(handle) || { handle, name: '', followsYou: false };
+      const old = scanMap.get(handle) || { handle, name: '', followsYou: false, canFollowBack: false, verified: false };
       if (account.name && !old.name) old.name = account.name;
       old.followsYou = old.followsYou || Boolean(account.followsYou);
+      old.canFollowBack = old.canFollowBack || Boolean(account.canFollowBack);
+      old.verified = old.verified || Boolean(account.verified);
       scanMap.set(handle, old);
+    });
+  }
+
+  function mergeFollowBackAccounts(accounts, mode) {
+    accounts.forEach((account) => {
+      const handle = normalizeHandle(account.handle);
+      if (!handle || !account.canFollowBack) return;
+      const old = followBackMap.get(handle) || { handle, name: '', followsYou: false, canFollowBack: false, verified: false, mode };
+      if (account.name && !old.name) old.name = account.name;
+      old.followsYou = old.followsYou || Boolean(account.followsYou);
+      old.canFollowBack = old.canFollowBack || Boolean(account.canFollowBack);
+      old.verified = old.verified || Boolean(account.verified) || mode === 'verified';
+      old.mode = mode;
+      followBackMap.set(handle, old);
     });
   }
 
@@ -135,6 +195,15 @@
       .filter((account) => !account.followsYou)
       .filter((account) => !keep.has(account.handle))
       .filter((account) => !done.has(account.handle))
+      .sort((a, b) => a.handle.localeCompare(b.handle));
+  }
+
+  function getFollowBackCandidates(mode = '') {
+    const { followDone } = stateSets();
+    return [...followBackMap.values()]
+      .filter((account) => account.canFollowBack)
+      .filter((account) => mode !== 'verified' || account.verified || account.mode === 'verified')
+      .filter((account) => !followDone.has(account.handle))
       .sort((a, b) => a.handle.localeCompare(b.handle));
   }
 
@@ -167,23 +236,36 @@
     const all = [...scanMap.values()];
     const nonMutual = getNonMutual();
     const onFollowingPage = isFollowingPage();
+    const onFollowersPage = isFollowersPage();
+    const onVerifiedFollowersPage = isVerifiedFollowersPage();
+    const followMode = onVerifiedFollowersPage ? 'verified' : onFollowersPage ? 'all' : state.view === 'followBackVerified' ? 'verified' : state.view === 'followBackAll' ? 'all' : '';
+    const followCandidates = getFollowBackCandidates(followMode);
+    const followSelected = stateSets().followSelected;
     const inferredHandle = inferHandleFromPage();
-    const rows = nonMutual.slice(0, 80).map((account) => `
+    const nonMutualRows = nonMutual.slice(0, 80).map((account) => `
       <div class="xfc-row" data-handle="${account.handle}">
         <div class="xfc-name">${escapeHtml(account.name || '-')}<br><a href="https://x.com/${account.handle}" target="_blank">@${account.handle}</a></div>
         <button class="keep" data-act="keep">Keep</button>
         <button class="pick ${selected.has(account.handle) ? 'active' : ''}" data-act="pick">${selected.has(account.handle) ? 'Picked' : 'Unfollow'}</button>
       </div>`).join('');
+    const followRows = followCandidates.slice(0, 80).map((account) => `
+      <div class="xfc-row" data-handle="${account.handle}">
+        <div class="xfc-name">${escapeHtml(account.name || '-')}<br><a href="https://x.com/${account.handle}" target="_blank">@${account.handle}</a></div>
+        <button class="keep" data-act="skip-followback">Skip</button>
+        <button class="pick ${followSelected.has(account.handle) ? 'active' : ''}" data-act="pick-followback">${followSelected.has(account.handle) ? 'Picked' : 'Follow back'}</button>
+      </div>`).join('');
+    const routePrompt = !onFollowingPage && !onFollowersPage && !onVerifiedFollowersPage;
 
     panel.innerHTML = `
       <div class="xfc-head"><span class="xfc-title">X Follow Cleaner</span><button data-act="minimize">Hide</button></div>
       <div class="xfc-body">
-        ${onFollowingPage ? '' : `<div class="xfc-route"><div class="xfc-log">Not on a following page. Enter a handle and open it.</div><div class="xfc-open-row"><input id="xfc-handle-input" placeholder="@your_handle" value="${escapeHtml(inferredHandle ? `@${inferredHandle}` : '')}"><button data-act="open-following">Open</button></div></div>`}
-        <div class="xfc-stats"><div class="xfc-stat"><strong>${all.length}</strong>Scanned</div><div class="xfc-stat"><strong>${nonMutual.length}</strong>Non-mutual</div><div class="xfc-stat"><strong>${keep.size}</strong>Whitelist</div></div>
+        ${routePrompt ? `<div class="xfc-route"><div class="xfc-log">Enter a handle, then choose a page.</div><div class="xfc-open-row"><input id="xfc-handle-input" placeholder="@your_handle" value="${escapeHtml(inferredHandle ? `@${inferredHandle}` : '')}"><button data-act="open-following">Following</button><button data-act="open-verified-followers">Verified followers</button><button data-act="open-followers">All followers</button></div></div>` : ''}
+        <div class="xfc-stats"><div class="xfc-stat"><strong>${all.length}</strong>Following scanned</div><div class="xfc-stat"><strong>${nonMutual.length}</strong>Non-mutual</div><div class="xfc-stat"><strong>${followCandidates.length}</strong>Can follow back</div></div>
         <div class="xfc-controls"><label>Batch size<input id="xfc-batch" type="number" min="1" max="100" value="${state.batchSize}"></label><label>Delay ms<input id="xfc-delay" type="number" min="2000" max="60000" step="500" value="${state.delayMs}"></label></div>
-        <div class="xfc-actions"><button data-act="scan" ${onFollowingPage ? '' : 'disabled'}>Scan</button><button class="secondary" data-act="select-all">Pick all</button><button class="secondary" data-act="export-keep">Export whitelist</button><button class="secondary" data-act="import-keep">Import whitelist</button><button class="secondary" data-act="export-nonmutual">Export non-mutual</button><button class="danger" data-act="unfollow" ${onFollowingPage ? '' : 'disabled'}>Start unfollow</button><button class="danger" data-act="stop">Stop</button></div>
-        <div class="xfc-list">${rows || '<div class="xfc-row"><div class="xfc-name">No non-mutual accounts scanned yet.</div></div>'}</div>
-        <div class="xfc-log" id="xfc-log">${onFollowingPage ? 'All data stays in this browser.' : 'Open a following page to enable scanning.'}</div>
+        <div class="xfc-actions"><button data-act="scan" ${onFollowingPage ? '' : 'disabled'}>Scan following</button><button class="secondary" data-act="select-all">Pick all non-mutual</button><button class="secondary" data-act="export-keep">Export whitelist</button><button class="secondary" data-act="import-keep">Import whitelist</button><button class="secondary" data-act="export-nonmutual">Export non-mutual</button><button class="danger" data-act="unfollow" ${onFollowingPage ? '' : 'disabled'}>Start unfollow</button></div>
+        <div class="xfc-actions"><button data-act="scan-followback-verified" ${onVerifiedFollowersPage ? '' : 'disabled'}>Scan verified followers</button><button data-act="scan-followback-all" ${onFollowersPage ? '' : 'disabled'}>Scan all followers</button><button class="secondary" data-act="open-verified-followers">Open verified</button><button class="secondary" data-act="open-followers">Open all</button><button class="secondary" data-act="select-all-followback">Pick all follow-back</button><button data-act="follow-back" ${(onFollowersPage || onVerifiedFollowersPage) ? '' : 'disabled'}>Start follow back</button><button class="danger" data-act="stop">Stop</button></div>
+        <div class="xfc-list">${followMode ? (followRows || '<div class="xfc-row"><div class="xfc-name">No follow-back candidates scanned yet.</div></div>') : (nonMutualRows || '<div class="xfc-row"><div class="xfc-name">No non-mutual accounts scanned yet.</div></div>')}</div>
+        <div class="xfc-log" id="xfc-log">${onFollowingPage || onFollowersPage || onVerifiedFollowersPage ? 'All data stays in this browser.' : 'Open a target page to enable scanning.'}</div>
       </div>`;
     bindPanel(panel);
   }
@@ -195,27 +277,49 @@
   }
 
   function persistControlValues() {
-    const { keep, selected, done } = stateSets();
-    persistSets({ keep, selected, done, batchSize: document.querySelector('#xfc-batch')?.value, delayMs: document.querySelector('#xfc-delay')?.value });
+    const { keep, selected, done, followSelected, followDone } = stateSets();
+    persistSets({ keep, selected, done, followSelected, followDone, batchSize: document.querySelector('#xfc-batch')?.value, delayMs: document.querySelector('#xfc-delay')?.value });
   }
 
   async function handleAction(action, handle) {
     if (action === 'minimize') return document.querySelector(`#${UI_ID}`)?.classList.toggle('minimized');
     if (action === 'open-following') return openFollowingPage();
+    if (action === 'open-followers') return openFollowersPage();
+    if (action === 'open-verified-followers') return openVerifiedFollowersPage();
     if (action === 'scan') return scanFollowing();
-    if (action === 'stop') { scanning = false; unfollowing = false; return log('Stop requested.'); }
+    if (action === 'scan-followback-all') return scanFollowBack('all');
+    if (action === 'scan-followback-verified') return scanFollowBack('verified');
+    if (action === 'stop') { scanning = false; unfollowing = false; followingBack = false; return log('Stop requested.'); }
     if (action === 'keep') return keepHandle(handle);
     if (action === 'pick') return togglePick(handle);
+    if (action === 'skip-followback') return skipFollowBack(handle);
+    if (action === 'pick-followback') return toggleFollowBackPick(handle);
     if (action === 'select-all') return selectAllNonMutual();
+    if (action === 'select-all-followback') return selectAllFollowBack();
     if (action === 'export-keep') return downloadJson('x-follow-cleaner-keep.json', stateSets().state.keep);
     if (action === 'import-keep') return importKeepPrompt();
     if (action === 'export-nonmutual') return downloadJson('x-follow-cleaner-non-mutual.json', getNonMutual());
     if (action === 'unfollow') return startUnfollow();
+    if (action === 'follow-back') return startFollowBack();
   }
 
   function openFollowingPage() {
     const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
     const url = getFollowingUrl(input);
+    if (!url) return log('Enter a handle, for example @Ryan61257127.');
+    location.href = url;
+  }
+
+  function openFollowersPage() {
+    const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
+    const url = getFollowersUrl(input);
+    if (!url) return log('Enter a handle, for example @Ryan61257127.');
+    location.href = url;
+  }
+
+  function openVerifiedFollowersPage() {
+    const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
+    const url = getVerifiedFollowersUrl(input);
     if (!url) return log('Enter a handle, for example @Ryan61257127.');
     location.href = url;
   }
@@ -242,6 +346,29 @@
     log(`Done: ${scanMap.size} accounts, ${getNonMutual().length} non-mutual.`);
   }
 
+  async function scanFollowBack(mode) {
+    if (scanning) return;
+    scanning = true;
+    persistSets({ ...stateSets(), view: mode === 'verified' ? 'followBackVerified' : 'followBackAll' });
+    log(`Scanning ${mode === 'verified' ? 'verified followers' : 'all followers'}...`);
+    let staleRounds = 0;
+    let previousSize = followBackMap.size;
+    for (let round = 0; round < 240 && scanning; round += 1) {
+      mergeFollowBackAccounts(parseVisibleAccounts(), mode);
+      staleRounds = followBackMap.size === previousSize ? staleRounds + 1 : 0;
+      previousSize = followBackMap.size;
+      render();
+      log(`Scanning: ${getFollowBackCandidates(mode).length} follow-back candidates.`);
+      if (staleRounds >= 12 && round > 15) break;
+      window.scrollBy(0, Math.floor(window.innerHeight * 0.9));
+      await sleep(900);
+    }
+    mergeFollowBackAccounts(parseVisibleAccounts(), mode);
+    scanning = false;
+    render();
+    log(`Done: ${getFollowBackCandidates(mode).length} follow-back candidates.`);
+  }
+
   function keepHandle(handle) {
     const { keep, selected, done } = stateSets();
     keep.add(normalizeHandle(handle));
@@ -259,9 +386,34 @@
   }
 
   function selectAllNonMutual() {
-    const { keep, selected, done } = stateSets();
+    const { keep, selected, done, followSelected, followDone } = stateSets();
     getNonMutual().forEach((account) => selected.add(account.handle));
-    persistSets({ keep, selected, done });
+    persistSets({ keep, selected, done, followSelected, followDone, view: '' });
+    render();
+  }
+
+  function toggleFollowBackPick(handle) {
+    const { keep, selected, done, followSelected, followDone } = stateSets();
+    const clean = normalizeHandle(handle);
+    followSelected.has(clean) ? followSelected.delete(clean) : followSelected.add(clean);
+    persistSets({ keep, selected, done, followSelected, followDone, view: loadState().view || 'followBackAll' });
+    render();
+  }
+
+  function skipFollowBack(handle) {
+    const { keep, selected, done, followSelected, followDone } = stateSets();
+    const clean = normalizeHandle(handle);
+    followSelected.delete(clean);
+    followDone.add(clean);
+    persistSets({ keep, selected, done, followSelected, followDone, view: loadState().view || 'followBackAll' });
+    render();
+  }
+
+  function selectAllFollowBack() {
+    const { keep, selected, done, followSelected, followDone } = stateSets();
+    const mode = isVerifiedFollowersPage() ? 'verified' : isFollowersPage() ? 'all' : loadState().view === 'followBackVerified' ? 'verified' : 'all';
+    getFollowBackCandidates(mode).forEach((account) => followSelected.add(account.handle));
+    persistSets({ keep, selected, done, followSelected, followDone, view: mode === 'verified' ? 'followBackVerified' : 'followBackAll' });
     render();
   }
 
@@ -310,6 +462,32 @@
     log('Batch complete.');
   }
 
+  async function startFollowBack() {
+    if (followingBack) return;
+    persistControlValues();
+    const mode = isVerifiedFollowersPage() ? 'verified' : isFollowersPage() ? 'all' : loadState().view === 'followBackVerified' ? 'verified' : 'all';
+    const { state, followSelected, followDone } = stateSets();
+    const queue = getFollowBackCandidates(mode).filter((account) => followSelected.has(account.handle)).filter((account) => !followDone.has(account.handle)).slice(0, Number(state.batchSize || 10));
+    if (!queue.length) return log('No selected follow-back accounts. Pick accounts first.');
+    followingBack = true;
+    for (const account of queue) {
+      if (!followingBack) break;
+      const ok = await followBackHandle(account.handle);
+      const latest = stateSets();
+      if (ok) {
+        latest.followDone.add(account.handle);
+        latest.followSelected.delete(account.handle);
+        persistSets({ ...latest, view: mode === 'verified' ? 'followBackVerified' : 'followBackAll' });
+      }
+      render();
+      log(`${ok ? 'Followed back' : 'Follow-back button not found'} @${account.handle}`);
+      await sleep(Number(loadState().delayMs || 4500));
+    }
+    followingBack = false;
+    render();
+    log('Follow-back batch complete.');
+  }
+
   async function unfollowHandle(handle) {
     const cell = findUserCell(normalizeHandle(handle));
     if (!cell) return false;
@@ -328,6 +506,20 @@
     });
     if (!confirm) return false;
     confirm.click();
+    return true;
+  }
+
+  async function followBackHandle(handle) {
+    const cell = findUserCell(normalizeHandle(handle));
+    if (!cell) return false;
+    cell.scrollIntoView({ block: 'center' });
+    await sleep(600);
+    const button = [...cell.querySelectorAll('button[role="button"], div[role="button"]')].find((candidate) => {
+      const text = candidate.innerText || candidate.getAttribute('aria-label') || '';
+      return text.includes(zh.followBack) || /follow back/i.test(text);
+    });
+    if (!button) return false;
+    button.click();
     return true;
   }
 
