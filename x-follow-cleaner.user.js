@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Follow Cleaner Local
 // @namespace    local.x.follow.cleaner
-// @version      0.4.0
+// @version      0.4.1
 // @description  本地优先的 X 互关清理、白名单、批量取关和批量回关工具。
 // @author       baor87492-star
 // @match        https://x.com/*
@@ -131,7 +131,7 @@
       done: [...(done || old.done || [])].filter(Boolean).sort(),
       followSelected: [...(followSelected || old.followSelected || [])].filter(Boolean).sort(),
       followDone: [...(followDone || old.followDone || [])].filter(Boolean).sort(),
-      view: view || old.view || '',
+      view: view !== undefined ? view : old.view || '',
       batchSize: Number(batchSize || old.batchSize || 10),
       delayMs: Number(delayMs || old.delayMs || 4500),
     });
@@ -238,7 +238,8 @@
     const onFollowingPage = isFollowingPage();
     const onFollowersPage = isFollowersPage();
     const onVerifiedFollowersPage = isVerifiedFollowersPage();
-    const followMode = onVerifiedFollowersPage ? 'verified' : onFollowersPage ? 'all' : state.view === 'followBackVerified' ? 'verified' : state.view === 'followBackAll' ? 'all' : '';
+    const activeView = onFollowingPage ? '' : onVerifiedFollowersPage ? 'followBackVerified' : onFollowersPage ? 'followBackAll' : state.view;
+    const followMode = activeView === 'followBackVerified' ? 'verified' : activeView === 'followBackAll' ? 'all' : '';
     const followCandidates = getFollowBackCandidates(followMode);
     const followSelected = stateSets().followSelected;
     const inferredHandle = inferHandleFromPage();
@@ -262,6 +263,7 @@
         ${routePrompt ? `<div class="xfc-route"><div class="xfc-log">输入账号，然后选择要打开的页面。</div><div class="xfc-open-row"><input id="xfc-handle-input" placeholder="@你的用户名" value="${escapeHtml(inferredHandle ? `@${inferredHandle}` : '')}"><button data-act="open-following">正在关注</button><button data-act="open-verified-followers">认证关注者</button><button data-act="open-followers">所有关注者</button></div></div>` : ''}
         <div class="xfc-stats"><div class="xfc-stat"><strong>${all.length}</strong>已扫关注</div><div class="xfc-stat"><strong>${nonMutual.length}</strong>未互关</div><div class="xfc-stat"><strong>${followCandidates.length}</strong>可回关</div></div>
         <div class="xfc-controls"><label>本次数量<input id="xfc-batch" type="number" min="1" max="100" value="${state.batchSize}"></label><label>间隔毫秒<input id="xfc-delay" type="number" min="2000" max="60000" step="500" value="${state.delayMs}"></label></div>
+        <div class="xfc-actions"><button class="secondary" data-act="view-following">查看未互关</button><button class="secondary" data-act="view-followback-verified">查看认证回关</button><button class="secondary" data-act="view-followback-all">查看全部回关</button></div>
         <div class="xfc-actions"><button data-act="scan" ${onFollowingPage ? '' : 'disabled'}>扫描正在关注</button><button class="secondary" data-act="select-all">全选未互关</button><button class="secondary" data-act="export-keep">导出白名单</button><button class="secondary" data-act="import-keep">导入白名单</button><button class="secondary" data-act="export-nonmutual">导出未互关</button><button class="danger" data-act="unfollow" ${onFollowingPage ? '' : 'disabled'}>开始取关</button></div>
         <div class="xfc-actions"><button data-act="scan-followback-verified" ${onVerifiedFollowersPage ? '' : 'disabled'}>扫描认证关注者</button><button data-act="scan-followback-all" ${onFollowersPage ? '' : 'disabled'}>扫描所有关注者</button><button class="secondary" data-act="open-verified-followers">打开认证关注者</button><button class="secondary" data-act="open-followers">打开所有关注者</button><button class="secondary" data-act="select-all-followback">全选可回关</button><button data-act="follow-back" ${(onFollowersPage || onVerifiedFollowersPage) ? '' : 'disabled'}>开始回关</button><button class="danger" data-act="stop">停止</button></div>
         <div class="xfc-list">${followMode ? (followRows || '<div class="xfc-row"><div class="xfc-name">还没有扫描到可回关账号。</div></div>') : (nonMutualRows || '<div class="xfc-row"><div class="xfc-name">还没有扫描到未互关账号。</div></div>')}</div>
@@ -286,6 +288,9 @@
     if (action === 'open-following') return openFollowingPage();
     if (action === 'open-followers') return openFollowersPage();
     if (action === 'open-verified-followers') return openVerifiedFollowersPage();
+    if (action === 'view-following') return switchView('');
+    if (action === 'view-followback-verified') return switchView('followBackVerified');
+    if (action === 'view-followback-all') return switchView('followBackAll');
     if (action === 'scan') return scanFollowing();
     if (action === 'scan-followback-all') return scanFollowBack('all');
     if (action === 'scan-followback-verified') return scanFollowBack('verified');
@@ -307,6 +312,7 @@
     const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
     const url = getFollowingUrl(input);
     if (!url) return log('请输入账号，例如 @Ryan61257127。');
+    switchView('', false);
     location.href = url;
   }
 
@@ -314,6 +320,7 @@
     const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
     const url = getFollowersUrl(input);
     if (!url) return log('请输入账号，例如 @Ryan61257127。');
+    switchView('followBackAll', false);
     location.href = url;
   }
 
@@ -321,7 +328,17 @@
     const input = document.querySelector('#xfc-handle-input')?.value || inferHandleFromPage();
     const url = getVerifiedFollowersUrl(input);
     if (!url) return log('请输入账号，例如 @Ryan61257127。');
+    switchView('followBackVerified', false);
     location.href = url;
+  }
+
+  function switchView(view, shouldRender = true) {
+    const { keep, selected, done, followSelected, followDone } = stateSets();
+    persistSets({ keep, selected, done, followSelected, followDone, view });
+    if (shouldRender) {
+      render();
+      log(view === 'followBackVerified' ? '已切换到认证关注者回关列表。' : view === 'followBackAll' ? '已切换到所有关注者回关列表。' : '已切换到未互关清理列表。');
+    }
   }
 
   async function scanFollowing() {
